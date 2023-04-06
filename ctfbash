@@ -1,0 +1,89 @@
+#!/bin/bash
+
+_netstat=/bin/netstat
+_awk=/usr/bin/awk
+_egrep=/bin/egrep
+_kill=/bin/kill
+_printf=/usr/bin/printf
+_sleep=/bin/sleep
+_ps=/bin/ps
+_tr=/usr/bin/tr
+
+trap cleanup EXIT
+
+$_printf "Let's grab all the TCP networking processes' names and try to resolve\n"
+$_printf "the local IP address of those with a full syn backlog.\n"
+
+pids=()
+
+cleanup() {
+$_printf "Cleaning up the environment.\n"
+for p in "${pids[@]}"
+do
+$_printf "Kill pid %d\n" $p
+$_kill -9 $p
+done
+}
+
+($_sleep 5 && cleanup) &
+
+# The "| egrep '^tcp'" part aims to filter out the command headers.  Otherwise
+# the first lines are:
+# "Active Internet connections (only servers)"
+# "Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name"
+output=$($_netstat -ntpl 2> /dev/null | $_egrep '^t')
+[[ $? -ne 0 ]] && { $_printf "netstat returns an error\n"; exit 1; }
+
+while IFS= read -r line
+do
+line=$($_printf "$line" | $_tr -d '()$`')
+cur_syn=$($_awk '{print $2}' <<< "$line")
+max_syn=$($_awk '{print $3}' <<< "$line")
+last_field=$($_awk '{print $NF}' <<< "$line")
+
+# Not a process we own?  Skip this line.
+if [[ "$last_field" == "-" ]]
+then    continue
+fi
+
+pid=$($_awk '{print $1}' FPAT='[0-9]{3,}' <<< "$last_field")
+name=$($_awk '{print $1}' FPAT='[^0-9]{2,}' <<< "$last_field")
+
+# extract PID from the string "pid/name"
+pid=${pid%/*}
+# Store the list of PIDs in an array;  we'll clean them up later
+piduser=$($_ps -ouser -p$pid h)
+if [ "$piduser" = "user" ]
+then    pids+=($pid)
+fi
+
+# First, some sanity checks.
+# Check that the last field is composed of numbers and string
+digit='[0-9]+'
+if [[ "x$name" == "x" || ! "${pid}" =~ $digit ]]
+then    $_printf "Invalid last field: %s\n" "$last_field"
+continue
+fi
+
+if [[ "$cur_syn" == "0" ||  "$max_syn" != "$cur_syn" ]]
+then    continue
+fi
+
+# For each matching process, apply the 'host' command to resolve
+# the address it's bound to.
+$_awk '{
+split($4, arr, ":")
+cmd="/usr/bin/host " arr[1]
+cmd | getline
+close(cmd)
+}' <<< "$line"
+
+if [[ $? != 0 ]]
+then    $_printf "awk(1) script failed.\n"
+exit 1
+fi
+
+# And finally, log the culprit process
+$_printf "%s has a full SYNs backlog: %s\n" "$name" "$max_syn"
+done <<< "$output"
+
